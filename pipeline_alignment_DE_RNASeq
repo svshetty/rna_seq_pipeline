@@ -1,0 +1,220 @@
+###############
+
+STAR 2-pass alignment for RNA-Seq Data
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3530905/
+Manual: https://physiology.med.cornell.edu/faculty/skrabanek/lab/angsd/lecture_notes/STARmanual.pdf
+
+##############################
+
+
+#######################################################
+Download the refGene.gtf from UCSC or Ensemble.
+
+#######################################################
+
+STAR 2 pass
+
+#######################################################
+
+
+#!/bin/bash                                                                     
+                                                                                
+##SBATCH -n 6                       # number of cores                           
+##SBATCH -t 0-18:00                  # wall time (D-HH:MM)                       
+###SBATCH -A svshetty             # Account hours will be pulled from (commented out with double # in front)
+##SBATCH -o slurm.%j.out             # STDOUT (%j = JobId)                       
+##SBATCH -e slurm.%j.err             # STDERR (%j = JobId)                       
+##SBATCH --mail-type=ALL             # Send a notification when the job starts, stops, or fails
+##SBATCH --mail-user=svshetty@asu.edu # send-to address                          
+
+module purge    # Always purge modules to ensure a consistent environment       
+                                                                                
+module load star/2.7.3a  
+
+
+1. Index hg38.
+STAR --runThreadN 6 \                                                           
+--runMode genomeGenerate \                                                      
+--genomeDir hg38_index \                                                        
+--genomeFastaFiles /scratch/svshetty/hg38_latest/hg38.fa \                      
+--sjdbGTFfile /scratch/svshetty/hg38_latest/genes/hg38.refGene.gtf \            
+--sjdbOverhang 99  
+
+2. Align all control samples to hg38 indexed files
+
+ IFS=$'\n'  
+arrayname=($(find "/scratch/svshetty/Yale_samples/Controls/" -type d -name "Sample_*"))
+for i in ${arrayname[@]}                                                        
+do                                                                              
+ R1=($(find "$i" -type f -name "*_R1_001.fastq.gz"))                            
+ R2=($(find "$i" -type f -name "*_R2_001.fastq.gz"))                            
+# echo $i $R1 $R2                                                                
+STAR --runMode alignReads 
+--genomeDir /scratch/svshetty/hg38_index
+--readFilesIn $R1 $R2  
+--readFilesCommand zcat  
+--outSAMtype BAM Unsorted  
+--outSAMstrandField intronMotif  
+--outFileNamePrefix $i  
+--outFilterIntronMotifs RemoveNoncanonical 
+--runThreadN 6 
+--genomeLoad LoadAndRemove
+done      
+
+3. Collect all SJindex files for controls into a single file.
+
+cat *.tab | awk '($5 > 0 && $7 > 2 && $6==0)' | cut -f1-6 | sort | uniq > SJ.filtered.Controls.tab
+
+STAR --runThreadN 6 \                                                           
+--runMode genomeGenerate \                                                      
+--genomeDir hg38_Control_SJindex \                                              
+--genomeFastaFiles /scratch/svshetty/hg38_latest/hg38.fa \                      
+--sjdbGTFfile /scratch/svshetty/hg38_latest/genes/hg38.refGene.gtf \            
+--sjdbOverhang 99\                                                              
+--sjdbFileChrStartEnd /scratch/svshetty/Yale_samples/SPATA/SJ.filtered.tab
+
+
+STAR --runThreadN 6 \                                                           
+--runMode genomeGenerate \                                                      
+--genomeDir hg38_SPATA_SJindex \                                                
+--genomeFastaFiles /scratch/svshetty/hg38_latest/hg38.fa \                      
+--sjdbGTFfile /scratch/svshetty/hg38_latest/genes/hg38.refGene.gtf \            
+--sjdbOverhang 99\                                                              
+--sjdbFileChrStartEnd /scratch/svshetty/Yale_samples/SPATA/SJ.filtered_SPATA.tab
+
+4. Realign using SJindex combined file
+
+IFS=$'\n'  arrayname=($(find "/scratch/svshetty/Yale_samples/Controls/" -type d -name "Sample_*"))
+for i in ${arrayname[@]}                                                        
+do                                                                              
+ R1=($(find "$i" -type f -name "*_R1_001.fastq.gz"))                            
+ R2=($(find "$i" -type f -name "*_R2_001.fastq.gz"))                            
+# echo $i $R1 $R2                                                                
+STAR --runMode alignReads --genomeDir /scratch/svshetty/hg38_Control_SJindex/ --readFilesIn $R1 $R2  --readFilesCommand zcat  --outSAMtype BAM Unsorted  --outSAMstrandField intronMotif  --outFileNamePrefix $i  --outFilterIntronMotifs RemoveNoncanonical --runThreadN 6 --genomeLoad LoadAndRemove
+done      
+
+######################################################################
+
+
+
+#######################################################
+
+PICARD
+
+#######################################################
+
+picard CollectRnaSeqMetrics I=Sample_GMO8399-24hr-3_131_062Aligned.out.bam O=output.metrics REF_FLAT= /scratch/svshetty/hg38_latest/refFlat.txt STRAND=SECOND_READ_TRANSCRIPTION_STRAND RIBOSOMAL_INTERVALS= /scratch/svshetty/hg38_latest/rRNA.interval_list 
+
+
+
+#######################################################
+
+#HTSeq is used to count the reads- Please refer to the documentation
+https://htseq.readthedocs.io/en/master/
+
+#######################################################
+
+htseq-count -f bam -r pos -s yes -i gene_id hg38_latest/genes/hg38.refGene.gtf  Sample_GMO2987-24hr-1_165_028Aligned.out.sorted.bam > Sample_GMO2987-24hr-1_165_028.count
+
+
+#######################################################
+
+DeSeq2 is used for post analysis to generate plots
+http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+#######################################################
+
+setwd("/media/sheetalshetty/NewDrive/Yale_samples/SPATA/")
+directory ="/media/sheetalshetty/NewDrive/Yale_samples/SPATA/"
+
+
+sampleFiles <- grep("treated",list.files(directory),value=TRUE)
+sampleCondition=gsub(".*\\.(.*)\\..*", "\\1",sampleFiles)
+
+sampleTable <- data.frame(sampleName = sampleFiles,
+                          fileName = sampleFiles,
+                          condition = sampleCondition)
+
+sampleTable$condition <- factor(sampleTable$condition)
+library("DESeq2")
+ddsHTSeq <- DESeqDataSetFromHTSeqCount(sampleTable = sampleTable,
+                                       directory = directory,
+                                       design= ~ condition)
+ddsHTSeq
+keep <- rowSums(counts(ddsHTSeq)) >= 10
+ddsHTSeq <- ddsHTSeq[keep,]
+
+ddsHTSeq$condition <- factor(ddsHTSeq$condition, levels = c("untreated","treated"))
+
+ddsHTSeq <- DESeq(ddsHTSeq)
+res <- results(ddsHTSeq)
+
+res <- results(ddsHTSeq, contrast=c("condition","treated","untreated"))
+resultsNames(ddsHTSeq)
+
+library("IHW")
+resIHW <- results(ddsHTSeq, filterFun=ihw)
+summary(resIHW)
+sum(resIHW$padj < 0.1, na.rm=TRUE)
+metadata(resIHW)$ihwResult
+
+resLFC <- lfcShrink(ddsHTSeq, coef="condition_treated_vs_untreated", type="apeglm")
+resNorm <- lfcShrink(ddsHTSeq, coef=2, type="normal")
+install.packages("ashr")
+library("ashr")
+resAsh <- lfcShrink(ddsHTSeq, coef=2, type="ashr")
+
+par(mfrow=c(1,3), mar=c(4,4,2,1))
+xlim <- c(1,1e5); ylim <- c(-3,3)
+plotMA(resLFC, xlim=xlim, ylim=ylim, main="apeglm")
+plotMA(resNorm, xlim=xlim, ylim=ylim, main="normal")
+plotMA(resAsh, xlim=xlim, ylim=ylim, main="ashr")
+
+ntd <- normTransform(ddsHTSeq)
+vsd <- vst(ddsHTSeq, blind=FALSE)
+rld <- rlog(ddsHTSeq, blind=FALSE)
+
+plotPCA(ntd, intgroup=c("condition", "sizeFactor"))
+plotPCA(vsd, intgroup=c("condition", "sizeFactor"))
+plotPCA(rld, intgroup=c("condition", "sizeFactor"))
+
+
+#######################################
+Standard_Deviation_PLOT transformed counts
+#######################################
+
+png ("SD_Plot_ntd.png")
+meanSdPlot(assay(ntd))
+dev.off()
+
+
+
+#######################################
+PCA_PLOT
+#######################################
+
+png("PCA_plot.png")
+plotPCA(ntd, intgroup=c("Condition", "sizeFactor"))
+dev.off()
+
+#######################################
+MA_PLOT
+#######################################
+
+png("MA_plot.png")
+plotMA(res, ylim=c(-2,2))
+dev.off()
+
+
+#######################################
+MA_PLOT_SHRINKAGE
+#######################################
+
+plotMA(resNorm, xlim=xlim, ylim=ylim, main="normal")
+png("MA_Shrinkage_plot.png")
+plotMA(resNorm, xlim=xlim, ylim=ylim, main="normal")
+
+
+
+
+
